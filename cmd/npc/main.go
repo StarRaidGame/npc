@@ -107,6 +107,24 @@ func run(addr string, version uint32, user, secret string) error {
 	}
 	slog.Info("self update", "object_id", su.ObjectId, "x", su.Position.GetX(), "y", su.Position.GetY())
 
+	// 4) Movement: ask to move toward a point and watch the position advance.
+	target := &pb.Vec2{X: 5000, Y: 3000}
+	if err := writeClient(conn, &pb.ClientMessage{Msg: &pb.ClientMessage_Move{
+		Move: &pb.Move{Target: target},
+	}}); err != nil {
+		return fmt.Errorf("send Move: %w", err)
+	}
+	slog.Info("moving", "target_x", target.X, "target_y", target.Y)
+	for i := 0; i < 5; i++ {
+		m, err := readServer(conn)
+		if err != nil {
+			return fmt.Errorf("read SelfUpdate: %w", err)
+		}
+		if u := m.GetSelfUpdate(); u != nil {
+			slog.Info("position", "object_id", u.ObjectId, "x", u.Position.GetX(), "y", u.Position.GetY())
+		}
+	}
+
 	// TODO: claim a role, pull a contract, act (later slices).
 	return nil
 }
