@@ -6,3 +6,7 @@
 # JetBrains IDEs (GoLand, IntelliJ, etc.)
 .idea/
 *.iml
+
+# Local Go workspace — points at the protocol checkout; per-developer, regenerable
+go.work
+go.work.sum
