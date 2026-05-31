@@ -2,3 +2,7 @@
 /dispatcher
 /bin/
 *.log
+
+# JetBrains IDEs (GoLand, IntelliJ, etc.)
+.idea/
+*.iml
