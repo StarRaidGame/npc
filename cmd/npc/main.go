@@ -84,6 +84,29 @@ func run(addr string, version uint32, user, secret string) error {
 		return fmt.Errorf("login rejected: %s", lr.Reason)
 	}
 	slog.Info("authenticated", "user", user)
+
+	// 3) Spawn / SelfAssign: the server tells us which object we control and its
+	// initial state (see docs/protocol.md "Session lifecycle").
+	saMsg, err := readServer(conn)
+	if err != nil {
+		return fmt.Errorf("read SelfAssign: %w", err)
+	}
+	sa := saMsg.GetSelfAssign()
+	if sa == nil {
+		return fmt.Errorf("expected SelfAssign, got %T", saMsg.Msg)
+	}
+	slog.Info("self assigned", "object_id", sa.ObjectId, "x", sa.Position.GetX(), "y", sa.Position.GetY())
+
+	suMsg, err := readServer(conn)
+	if err != nil {
+		return fmt.Errorf("read SelfUpdate: %w", err)
+	}
+	su := suMsg.GetSelfUpdate()
+	if su == nil {
+		return fmt.Errorf("expected SelfUpdate, got %T", suMsg.Msg)
+	}
+	slog.Info("self update", "object_id", su.ObjectId, "x", su.Position.GetX(), "y", su.Position.GetY())
+
 	// TODO: claim a role, pull a contract, act (later slices).
 	return nil
 }
