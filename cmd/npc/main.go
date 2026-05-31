@@ -85,43 +85,50 @@ func run(addr string, version uint32, user, secret string) error {
 	}
 	slog.Info("authenticated", "user", user)
 
-	// 3) Spawn / SelfAssign: the server tells us which object we control and its
-	// initial state (see docs/protocol.md "Session lifecycle").
-	saMsg, err := readServer(conn)
-	if err != nil {
-		return fmt.Errorf("read SelfAssign: %w", err)
-	}
-	sa := saMsg.GetSelfAssign()
-	if sa == nil {
-		return fmt.Errorf("expected SelfAssign, got %T", saMsg.Msg)
-	}
-	slog.Info("self assigned", "object_id", sa.ObjectId, "x", sa.Position.GetX(), "y", sa.Position.GetY())
-
-	suMsg, err := readServer(conn)
-	if err != nil {
-		return fmt.Errorf("read SelfUpdate: %w", err)
-	}
-	su := suMsg.GetSelfUpdate()
-	if su == nil {
-		return fmt.Errorf("expected SelfUpdate, got %T", suMsg.Msg)
-	}
-	slog.Info("self update", "object_id", su.ObjectId, "x", su.Position.GetX(), "y", su.Position.GetY())
-
-	// 4) Movement: ask to move toward a point and watch the position advance.
-	target := &pb.Vec2{X: 5000, Y: 3000}
-	if err := writeClient(conn, &pb.ClientMessage{Msg: &pb.ClientMessage_Move{
-		Move: &pb.Move{Target: target},
-	}}); err != nil {
-		return fmt.Errorf("send Move: %w", err)
-	}
-	slog.Info("moving", "target_x", target.X, "target_y", target.Y)
-	for i := 0; i < 5; i++ {
+	// 3) Live session: the server assigns our controlled object (SelfAssign +
+	// SelfUpdate) and announces the neighbours we can perceive (ObjectEnter). We
+	// dispatch by message type because those beacons are interleaved with our own
+	// updates; once assigned we issue a Move and watch our position advance.
+	assigned := false
+	moveSent := false
+	selfUpdates := 0
+	for {
 		m, err := readServer(conn)
 		if err != nil {
-			return fmt.Errorf("read SelfUpdate: %w", err)
+			return fmt.Errorf("read server message: %w", err)
 		}
-		if u := m.GetSelfUpdate(); u != nil {
-			slog.Info("position", "object_id", u.ObjectId, "x", u.Position.GetX(), "y", u.Position.GetY())
+		switch {
+		case m.GetSelfAssign() != nil:
+			sa := m.GetSelfAssign()
+			assigned = true
+			slog.Info("self assigned", "object_id", sa.ObjectId, "x", sa.Position.GetX(), "y", sa.Position.GetY())
+		case m.GetSelfUpdate() != nil:
+			su := m.GetSelfUpdate()
+			selfUpdates++
+			slog.Info("self update", "object_id", su.ObjectId, "x", su.Position.GetX(), "y", su.Position.GetY())
+			if assigned && !moveSent {
+				target := &pb.Vec2{X: 5000, Y: 3000}
+				if err := writeClient(conn, &pb.ClientMessage{Msg: &pb.ClientMessage_Move{
+					Move: &pb.Move{Target: target},
+				}}); err != nil {
+					return fmt.Errorf("send Move: %w", err)
+				}
+				moveSent = true
+				slog.Info("moving", "target_x", target.X, "target_y", target.Y)
+			}
+		case m.GetObjectEnter() != nil:
+			oe := m.GetObjectEnter()
+			slog.Info("neighbour entered", "object_id", oe.ObjectId, "x", oe.Position.GetX(), "y", oe.Position.GetY())
+		case m.GetObjectUpdate() != nil:
+			ou := m.GetObjectUpdate()
+			slog.Info("neighbour moved", "object_id", ou.ObjectId, "x", ou.Position.GetX(), "y", ou.Position.GetY())
+		case m.GetObjectLeave() != nil:
+			ol := m.GetObjectLeave()
+			slog.Info("neighbour left", "object_id", ol.ObjectId)
+		}
+		// Exit once we've watched our own ship move a few times.
+		if moveSent && selfUpdates >= 6 {
+			break
 		}
 	}
 
