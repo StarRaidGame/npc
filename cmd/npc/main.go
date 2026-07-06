@@ -2,20 +2,27 @@
 // over the same wire protocol as a human (see docs/npc.md). Fork it to automate
 // your own account.
 //
-// For now it exercises the first server slice: version handshake + login. The
-// framing/codec is inlined (a shared client SDK across modules is a later
-// concern); it mirrors server/internal/wire.
+// Two modes: the default runs a short demo (handshake → login → one move → watch
+// a few updates → exit); -persist keeps the session alive and wanders until the
+// server drops the connection or the process is signalled — the shape the
+// dispatcher spawns to populate the world with NPCs. The framing/codec is inlined
+// (a shared client SDK across modules is a later concern); it mirrors
+// server/internal/wire.
 package main
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand"
 	"net"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"google.golang.org/protobuf/proto"
@@ -25,29 +32,78 @@ import (
 
 const maxFrameSize = 1 << 20 // must match the server's wire.MaxFrameSize
 
+// wanderInterval is how often a persistent bot picks a new destination.
+const wanderInterval = 6 * time.Second
+
 func main() {
 	server := flag.String("server", "localhost:60000", "game server address")
 	user := flag.String("user", "dev", "login username")
 	secret := flag.String("secret", "", "login secret")
 	version := flag.Uint("version", 1, "protocol version to announce")
+	persist := flag.Bool("persist", false, "stay connected and wander until disconnected (NPC mode)")
 	flag.Parse()
 
-	slog.Info("starraid npc (reference bot) starting", "server", *server)
-	if err := run(*server, uint32(*version), *user, *secret); err != nil {
+	slog.Info("starraid npc (reference bot) starting", "server", *server, "persist", *persist)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	if err := run(ctx, *server, uint32(*version), *user, *secret, *persist); err != nil {
 		slog.Error("npc session failed", "err", err)
 		os.Exit(1)
 	}
 }
 
-func run(addr string, version uint32, user, secret string) error {
+func run(ctx context.Context, addr string, version uint32, user, secret string, persist bool) error {
+	if persist {
+		return runPersistent(ctx, addr, version, user, secret)
+	}
 	conn, err := net.DialTimeout("tcp", addr, 10*time.Second)
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
 	}
 	defer conn.Close()
+	// A deadline covers only the handshake+login so a half-open server can't hang us.
 	_ = conn.SetDeadline(time.Now().Add(15 * time.Second))
+	if err := handshakeLogin(conn, version, user, secret); err != nil {
+		return err
+	}
+	return demo(conn)
+}
 
-	// 1) Version handshake.
+// runPersistent connects and wanders, retrying only the initial dial (the
+// dispatcher tends to launch bots the moment the server starts, so it may not be
+// listening yet). Once connected, an auth/protocol failure is terminal, and a
+// mid-session disconnect means the server retired us — a clean exit either way.
+func runPersistent(ctx context.Context, addr string, version uint32, user, secret string) error {
+	for attempt := 0; attempt < 10; attempt++ {
+		conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			slog.Info("server unreachable; retrying", "attempt", attempt+1, "err", err)
+			select {
+			case <-time.After(1500 * time.Millisecond):
+			case <-ctx.Done():
+				return nil
+			}
+			continue
+		}
+		_ = conn.SetDeadline(time.Now().Add(15 * time.Second))
+		if err := handshakeLogin(conn, version, user, secret); err != nil {
+			conn.Close()
+			return err // auth/protocol failure is terminal — don't hammer the server
+		}
+		_ = conn.SetDeadline(time.Time{})
+		err = wander(ctx, conn)
+		conn.Close()
+		return err
+	}
+	return fmt.Errorf("server unreachable after retries")
+}
+
+// handshakeLogin runs version negotiation then login, returning an error on any
+// rejection or protocol surprise.
+func handshakeLogin(conn net.Conn, version uint32, user, secret string) error {
 	if err := writeClient(conn, &pb.ClientMessage{Msg: &pb.ClientMessage_Hello{
 		Hello: &pb.Hello{ProtocolVersion: version},
 	}}); err != nil {
@@ -64,9 +120,7 @@ func run(addr string, version uint32, user, secret string) error {
 	if !vr.Accepted {
 		return fmt.Errorf("version %d rejected; server wants >= %d", version, vr.MinSupported)
 	}
-	slog.Info("version accepted", "protocol_version", version)
 
-	// 2) Login.
 	if err := writeClient(conn, &pb.ClientMessage{Msg: &pb.ClientMessage_Login{
 		Login: &pb.LoginRequest{Username: user, Secret: secret},
 	}}); err != nil {
@@ -84,14 +138,13 @@ func run(addr string, version uint32, user, secret string) error {
 		return fmt.Errorf("login rejected: %s", lr.Reason)
 	}
 	slog.Info("authenticated", "user", user)
+	return nil
+}
 
-	// 3) Live session: the server assigns our controlled object (SelfAssign +
-	// SelfUpdate) and announces the neighbours we can perceive (ObjectEnter). We
-	// dispatch by message type because those beacons are interleaved with our own
-	// updates; once assigned we issue a Move and watch our position advance.
-	assigned := false
-	moveSent := false
-	selfUpdates := 0
+// demo is the default short-lived behaviour: once assigned, issue one Move and
+// watch our position advance a few times, then exit.
+func demo(conn net.Conn) error {
+	assigned, moveSent, selfUpdates := false, false, 0
 	for {
 		m, err := readServer(conn)
 		if err != nil {
@@ -107,34 +160,76 @@ func run(addr string, version uint32, user, secret string) error {
 			selfUpdates++
 			slog.Info("self update", "object_id", su.ObjectId, "x", su.Position.GetX(), "y", su.Position.GetY())
 			if assigned && !moveSent {
-				target := &pb.Vec2{X: 5000, Y: 3000}
-				if err := writeClient(conn, &pb.ClientMessage{Msg: &pb.ClientMessage_Move{
-					Move: &pb.Move{Target: target},
-				}}); err != nil {
-					return fmt.Errorf("send Move: %w", err)
+				if err := sendMove(conn, 5000, 3000); err != nil {
+					return err
 				}
 				moveSent = true
-				slog.Info("moving", "target_x", target.X, "target_y", target.Y)
 			}
-		case m.GetObjectEnter() != nil:
-			oe := m.GetObjectEnter()
-			slog.Info("neighbour entered", "object_id", oe.ObjectId, "x", oe.Position.GetX(), "y", oe.Position.GetY())
-		case m.GetObjectUpdate() != nil:
-			ou := m.GetObjectUpdate()
-			slog.Info("neighbour moved", "object_id", ou.ObjectId, "x", ou.Position.GetX(), "y", ou.Position.GetY())
-		case m.GetObjectLeave() != nil:
-			ol := m.GetObjectLeave()
-			slog.Info("neighbour left", "object_id", ol.ObjectId)
 		}
-		// Exit once we've watched our own ship move a few times.
 		if moveSent && selfUpdates >= 6 {
-			break
+			return nil
 		}
 	}
-
-	// TODO: claim a role, pull a contract, act (later slices).
-	return nil
 }
+
+// wander is the persistent NPC loop: once assigned, keep picking new destinations
+// on a ticker until the server drops the connection (the bot then self-terminates,
+// per docs/npc.md) or the process is signalled. A reader goroutine drains inbound
+// messages and reports disconnect; only this goroutine writes to the connection.
+func wander(ctx context.Context, conn net.Conn) error {
+	readErr := make(chan error, 1)
+	assigned := make(chan struct{}, 1)
+	go func() {
+		seen := false
+		for {
+			m, err := readServer(conn)
+			if err != nil {
+				readErr <- err
+				return
+			}
+			if !seen && m.GetSelfAssign() != nil {
+				seen = true
+				assigned <- struct{}{}
+			}
+		}
+	}()
+
+	select {
+	case <-assigned:
+	case err := <-readErr:
+		return fmt.Errorf("disconnected before assignment: %w", err)
+	case <-ctx.Done():
+		return nil
+	}
+
+	if err := sendMove(conn, randCoord(), randCoord()); err != nil {
+		return err
+	}
+	ticker := time.NewTicker(wanderInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil // signalled → exit cleanly
+		case <-readErr:
+			return nil // server dropped us → NPC self-terminates
+		case <-ticker.C:
+			if err := sendMove(conn, randCoord(), randCoord()); err != nil {
+				return nil // write failed → treat as disconnect
+			}
+		}
+	}
+}
+
+func sendMove(conn net.Conn, x, y int64) error {
+	return writeClient(conn, &pb.ClientMessage{Msg: &pb.ClientMessage_Move{
+		Move: &pb.Move{Target: &pb.Vec2{X: x, Y: y}},
+	}})
+}
+
+// randCoord returns a wander destination in [-8000, 8000] (math/rand is
+// auto-seeded per process, so each bot process wanders differently).
+func randCoord() int64 { return int64(rand.Intn(16001) - 8000) }
 
 // --- inline framing/codec (mirrors server/internal/wire) ---
 
